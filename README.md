@@ -213,6 +213,9 @@ Arduino Mega에 업로드되는 sketch이다.
 | Launcher 3 | D9, D10 |
 | Launcher 4 | D12, D13 |
 
+- 아두이노에 업로드되는 .ino 코드는 유일하므로, 다른 하드웨어 컨트롤 동작도 이 코드에 병합하여 작성
+- 병합 시 launcher.ino 파일명 적절하게 변경
+
 ---
 
 ## 4. Required Python Packages
@@ -243,13 +246,13 @@ cd ME340_ws
 가상환경을 생성한다.
 
 ```bash
-python3 -m venv venv
+python3 -m venv .venv
 ```
 
 가상환경을 활성화한다.
 
 ```bash
-source venv/bin/activate
+source .venv/bin/activate
 ```
 
 필요 package를 설치한다.
@@ -320,7 +323,7 @@ sudo reboot
 
 ```bash
 cd ME340_ws
-source venv/bin/activate
+source .venv/bin/activate
 python main.py
 ```
 
@@ -435,15 +438,12 @@ arduino/launcher/launcher.ino
 
 ```text
 hardware/IR_controller.py
-arduino/IR/IR.ino
 ```
 
 예상 역할:
 
 - IR sensor input 수신
-- 공 통과 여부 판정
-- 사용자 반응 성공/실패 판정
-- 반응 시간 계산
+- 성공 ball 개수 판정
 - score system과 연동
 
 향후 구조 예시는 다음과 같다.
