@@ -1,0 +1,50 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python tooling/cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local environment/config
+.env
+.env.*
+*.local
+
+# Runtime logs/output
+*.log
+logs/
+
+# Editor/OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
+
+# Arduino/generated build artifacts
+*.hex
+*.elf
+*.eep
+*.lst
+*.map
+*.bin
+*.ino.*
+
+# Local assistant/session metadata
+.agents/
+.codex/
