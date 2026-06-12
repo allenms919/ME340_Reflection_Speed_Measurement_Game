@@ -167,12 +167,3 @@ ls /dev/ttyACM* /dev/ttyUSB*
 ```
 
 포트 번호를 `cfg.py`의 `LAUNCHER_SERIAL_PORT`, `DETECTOR_SERIAL_PORT`에 반영 후 실행.
-
----
-
-## Troubleshooting
-
-**포트 권한 오류:**
-```bash
-sudo usermod -a -G dialout $USER && sudo reboot
-```
