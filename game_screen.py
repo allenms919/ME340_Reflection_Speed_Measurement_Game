@@ -1,409 +1,735 @@
 # game_screen.py
 # ============================================================
-# Pygame Screen Layer
-# This module focuses on display and user input only.
+# ME340 Reaction Test Game — pygame UI
+# Run: python3 main.py --gui
 # ============================================================
 
-from typing import Optional, Tuple
+import queue
+import threading
+import random
+import time
 
 import pygame
 
 import cfg
 from game_engine import GameEngine
+from hardware import MegaController, UnoController
 
 
-class Button:
-    """
-    pygame 화면에서 사용하는 단순 버튼 클래스입니다.
-    """
+# ─────────────────────────────────────────────────────────────
+# Colors
+# ─────────────────────────────────────────────────────────────
 
-    def __init__(
-        self,
-        rect: Tuple[int, int, int, int],
-        text: str,
-        font: pygame.font.Font,
-    ):
-        self.rect = pygame.Rect(rect)
-        self.text = text
-        self.font = font
+C_BG       = (14, 14, 26)
+C_PANEL    = (26, 26, 46)
+C_LAUNCHER = (40, 42, 70)
+C_FIRE     = (255, 195, 40)
+C_BALL     = (230, 88, 36)
+C_BALL_HI  = (255, 160, 80)
+C_TEXT     = (208, 212, 222)
+C_DIM      = (85, 90, 110)
+C_ACCENT   = (76, 158, 252)
+C_SUCCESS  = (68, 208, 68)
+C_WARN     = (255, 172, 36)
+C_DANGER   = (212, 62, 62)
 
-    def is_hovered(self, mouse_pos: Tuple[int, int]) -> bool:
-        return self.rect.collidepoint(mouse_pos)
+# ─────────────────────────────────────────────────────────────
+# Layout constants
+# ─────────────────────────────────────────────────────────────
 
-    def draw(
-        self,
-        surface: pygame.Surface,
-        mouse_pos: Tuple[int, int],
-        active: bool = False,
-    ) -> None:
-        if active:
-            color = cfg.COLOR_BUTTON_ACTIVE
-        elif self.is_hovered(mouse_pos):
-            color = cfg.COLOR_BUTTON_HOVER
+W, H = 900, 580
+
+L_XS       = [150, 350, 550, 750]
+L_TOP      = 62
+L_BTM      = 215
+L_W        = 66
+
+BALL_R     = 13
+BALL_SPAWN = L_BTM + BALL_R + 2
+BALL_LAND  = 390
+
+STATUS_CY  = 310
+INPUT_Y    = 468
+
+
+# ─────────────────────────────────────────────────────────────
+# Ball animation
+# ─────────────────────────────────────────────────────────────
+
+class Ball:
+    def __init__(self, launcher_idx: int):
+        self.x  = float(L_XS[launcher_idx])
+        self.y  = float(BALL_SPAWN)
+        self.vy = 2.8
+
+    def update(self) -> bool:
+        self.y  += self.vy
+        self.vy += 0.20
+        return self.y < BALL_LAND
+
+    def draw(self, surf):
+        ix, iy = int(self.x), int(self.y)
+        pygame.draw.circle(surf, C_BALL,    (ix, iy),     BALL_R)
+        pygame.draw.circle(surf, C_BALL_HI, (ix-4, iy-4), BALL_R // 3)
+
+
+# ─────────────────────────────────────────────────────────────
+# Shared state
+# ─────────────────────────────────────────────────────────────
+
+class GameState:
+    def __init__(self):
+        self.lock               = threading.Lock()
+        self.screen             = "menu"   # "menu" | "game"
+        self.mode               = ""
+        self.active_launchers   : set  = set()
+        self.pending_spawns     : list = []
+        # status lines
+        self.line0              = ""
+        self.line1              = ""
+        # input prompts
+        self.waiting_input      = False
+        self.selecting_diff     = False
+        self.selecting_launcher = False   # dual mode questioner
+        self.questioner         = ""      # "A" or "B"
+        self.prompt             = ""
+        # round/train result (set by _on_round_result)
+        self.round_result       = None    # None | {"count": int, "total": int, "passed": bool, "level": int}
+        # dual final result
+        self.dual_result        = None    # None | {"a": int, "b": int | None}
+
+
+# ─────────────────────────────────────────────────────────────
+# GUI hardware stubs
+# ─────────────────────────────────────────────────────────────
+
+class _GUIMega:
+    is_connected = True
+
+    def __init__(self, st: GameState):
+        self.st = st
+
+    def fire(self, launcher_numbers: list, mode: str = "fall") -> None:
+        print(f"    [GUI] fire {launcher_numbers} ({mode})")
+        with self.st.lock:
+            self.st.active_launchers = set(launcher_numbers)
+            self.st.pending_spawns.extend(launcher_numbers)
+        time.sleep(0.13)
+        with self.st.lock:
+            self.st.active_launchers = set()
+
+    def close(self) -> None: pass
+
+
+class _GUIUno:
+    is_connected = True
+
+    def reset_count(self) -> None: pass
+
+    def read_count_fast(self) -> int: return 0
+
+    def read_ball_count(self) -> int:
+        n = random.randint(0, cfg.SCORE_BALLS)   # score mode 기준 상한
+        print(f"    [GUI] ball count: {n}")
+        return n
+
+    def close(self) -> None: pass
+
+
+# ─────────────────────────────────────────────────────────────
+# Real hardware wrapper
+# ─────────────────────────────────────────────────────────────
+
+class _RealMega(MegaController):
+    def __init__(self, st: GameState):
+        super().__init__()
+        self.st = st
+
+    def fire(self, launcher_numbers: list, mode: str = "fall") -> None:
+        with self.st.lock:
+            self.st.active_launchers = set(launcher_numbers)
+            self.st.pending_spawns.extend(launcher_numbers)
+        super().fire(launcher_numbers, mode)
+        with self.st.lock:
+            self.st.active_launchers = set()
+
+
+# ─────────────────────────────────────────────────────────────
+# GUI game engine
+# ─────────────────────────────────────────────────────────────
+
+class _GUIEngine(GameEngine):
+    def __init__(self, st: GameState):
+        if cfg.SIMULATION_MODE:
+            mega = _GUIMega(st)
+            uno  = _GUIUno()
         else:
-            color = cfg.COLOR_BUTTON
+            mega = _RealMega(st)
+            uno  = UnoController()
+        super().__init__(mega, uno)
+        self.st = st
+        self.q  : queue.Queue = queue.Queue()
 
-        pygame.draw.rect(surface, color, self.rect, border_radius=14)
+    def _set(self, l0: str, l1: str = "") -> None:
+        with self.st.lock:
+            self.st.line0 = l0
+            self.st.line1 = l1
 
-        text_surface = self.font.render(self.text, True, cfg.COLOR_TEXT)
-        text_rect = text_surface.get_rect(center=self.rect.center)
+    # ── Display overrides ─────────────────────────────────────
 
-        surface.blit(text_surface, text_rect)
+    def _preflight_countdown(self) -> None:
+        with self.st.lock:
+            self.st.round_result = None
+        for i in range(3, 0, -1):
+            self._set("Starting in", str(i))
+            print(f"    Starting in {i}...")
+            time.sleep(1.0)
+        self._set("", "")
 
+    def _wait_and_read(self) -> int:
+        for i in range(int(cfg.POST_FIRE_WAIT_SEC), 0, -1):
+            self._set("Reading...", str(i))
+            print(f"    {i}...")
+            time.sleep(1.0)
+        self._set("", "")
+        return self._read_delta()
+
+    def _fire_level(self, diff, total_balls=None) -> None:
+        with self.st.lock:
+            self.st.round_result = None
+        self._set("Firing...", "")
+        super()._fire_level(diff, total_balls)
+
+    # ── Result hooks ──────────────────────────────────────────
+
+    def _on_round_result(self, level: int, count: int, passed: bool) -> None:
+        with self.st.lock:
+            self.st.round_result = {
+                "count":  count,
+                "total":  cfg.ROUND_BALLS,
+                "passed": passed,
+                "level":  level,
+            }
+        self._set("", "")
+
+    def _on_game_end(self, grade: str, cleared: bool) -> None:
+        with self.st.lock:
+            self.st.round_result = None
+        if cleared:
+            self._set("GAME CLEAR!", f"Grade: {grade}")
+        else:
+            self._set("GAME OVER", f"Grade: {grade}")
+
+    def _on_score_result(self, count: int, score: int) -> None:
+        max_s = cfg.SCORE_BALLS * cfg.SCORE_PER_BALL
+        self._set(f"Score: {score}/{max_s}", f"{count}/{cfg.SCORE_BALLS} balls")
+
+    def _on_dual_a_result(self, a_count: int) -> None:
+        self._set(f"Player A: {a_count}/{cfg.DUAL_BALLS}", "")
+
+    def _on_dual_final(self, a_count: int, b_count) -> None:
+        with self.st.lock:
+            self.st.dual_result = {"a": a_count, "b": b_count}
+
+    def _on_dual_round_end(self) -> None:
+        with self.st.lock:
+            self.st.selecting_launcher = False
+            self.st.questioner         = ""
+
+    # ── Input overrides ───────────────────────────────────────
+
+    def _ask_ssh(self, prompt: str) -> bool:
+        with self.st.lock:
+            self.st.prompt        = prompt
+            self.st.waiting_input = True
+        result = self.q.get()
+        with self.st.lock:
+            self.st.prompt        = ""
+            self.st.waiting_input = False
+        return result
+
+    def _ask_difficulty(self) -> int:
+        with self.st.lock:
+            self.st.selecting_diff = True
+            self.st.prompt         = "Choose level:"
+        result = self.q.get()
+        with self.st.lock:
+            self.st.selecting_diff = False
+            self.st.prompt         = ""
+        return result
+
+    def _ask_launcher(self, questioner: str, timeout: float = 20.0) -> int | None:
+        with self.st.lock:
+            self.st.selecting_launcher = True
+            self.st.questioner         = questioner
+        try:
+            return self.q.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+
+# ─────────────────────────────────────────────────────────────
+# Button helper
+# ─────────────────────────────────────────────────────────────
+
+class _Btn:
+    def __init__(self, rect, label, font, cn=C_PANEL, ch=C_ACCENT, ct=C_TEXT):
+        self.r  = pygame.Rect(rect)
+        self.lb = label
+        self.fn = font
+        self.cn, self.ch, self.ct = cn, ch, ct
+
+    def draw(self, surf, mp):
+        c = self.ch if self.r.collidepoint(mp) else self.cn
+        pygame.draw.rect(surf, c, self.r, border_radius=10)
+        t = self.fn.render(self.lb, True, self.ct)
+        surf.blit(t, t.get_rect(center=self.r.center))
+
+    def hit(self, mp, ev):
+        return (ev.type == pygame.MOUSEBUTTONDOWN
+                and ev.button == 1
+                and self.r.collidepoint(mp))
+
+
+# ─────────────────────────────────────────────────────────────
+# Main screen
+# ─────────────────────────────────────────────────────────────
 
 class GameScreen:
-    """
-    pygame 화면과 사용자 입력을 담당합니다.
 
-    이 클래스는 launcher_controller를 직접 사용하지 않습니다.
-    게임 로직은 GameEngine에 위임합니다.
-    """
-
-    def __init__(self, engine: GameEngine):
+    def __init__(self):
         pygame.init()
-
-        self.engine = engine
-
-        self.screen = pygame.display.set_mode(
-            (cfg.WINDOW_WIDTH, cfg.WINDOW_HEIGHT)
-        )
-        pygame.display.set_caption(cfg.WINDOW_TITLE)
-
+        self._fullscreen  = False
+        self._screen_surf = pygame.display.set_mode((W, H))
+        self.surf         = pygame.Surface((W, H))
+        pygame.display.set_caption("REFLECTION SPEED MEASUREMENT GAME")
         self.clock = pygame.time.Clock()
-        self.running = True
+        self.alive = True
 
-        self.font_title = pygame.font.SysFont(cfg.FONT_NAME, cfg.FONT_SIZE_TITLE)
-        self.font_large = pygame.font.SysFont(cfg.FONT_NAME, cfg.FONT_SIZE_LARGE)
-        self.font_medium = pygame.font.SysFont(cfg.FONT_NAME, cfg.FONT_SIZE_MEDIUM)
-        self.font_small = pygame.font.SysFont(cfg.FONT_NAME, cfg.FONT_SIZE_SMALL)
-        self.font_tiny = pygame.font.SysFont(cfg.FONT_NAME, cfg.FONT_SIZE_TINY)
+        self.st    = GameState()
+        self.eng   = _GUIEngine(self.st)
+        self.balls : list[Ball] = []
 
-        self.start_button = Button(
-            rect=(cfg.WINDOW_WIDTH // 2 - 120, 330, 240, 70),
-            text="START",
-            font=self.font_medium,
-        )
+        F = pygame.font.SysFont
+        self.fT  = F("monospace", 40, bold=True)
+        self.fL  = F("monospace", 27, bold=True)
+        self.fM  = F("monospace", 21)
+        self.fS  = F("monospace", 16)
+        self.fX  = F("monospace", 13)
+        self.fLN = F("monospace", 30, bold=True)
 
-        self.restart_button = Button(
-            rect=(cfg.WINDOW_WIDTH // 2 - 120, 330, 240, 70),
-            text="RESTART",
-            font=self.font_medium,
-        )
+        self._build_buttons()
 
-        self.difficulty_buttons = {
-            "EASY": Button((170, 230, 150, 55), "EASY", self.font_small),
-            "NORMAL": Button((375, 230, 150, 55), "NORMAL", self.font_small),
-            "HARD": Button((580, 230, 150, 55), "HARD", self.font_small),
-        }
+    def _build_buttons(self):
+        cx, bw, bh = W // 2, 235, 52
+
+        self.menu_btns = [
+            _Btn((cx - bw//2, 160, bw, bh), "1   Round Mode", self.fM),
+            _Btn((cx - bw//2, 222, bw, bh), "2   Score Mode", self.fM),
+            _Btn((cx - bw//2, 284, bw, bh), "3   Train Mode", self.fM),
+            _Btn((cx - bw//2, 346, bw, bh), "4   Dual Mode",  self.fM),
+        ]
+
+        by = INPUT_Y + 32
+        self.yes_btn = _Btn((cx - 122, by, 108, 44), "Y   Yes", self.fM,
+                            (22, 62, 22), (42, 138, 42))
+        self.no_btn  = _Btn((cx + 14,  by, 108, 44), "N   No",  self.fM,
+                            (68, 22, 22), (138, 42, 42))
+
+        # 5 difficulty buttons
+        dw, dh, gap = 128, 44, 8
+        tw  = 5 * dw + 4 * gap
+        dx0 = (W - tw) // 2
+        self.diff_btns = [
+            _Btn((dx0 + i * (dw + gap), INPUT_Y + 32, dw, dh),
+                 f"{i+1} {cfg.DIFFICULTY[i+1]['name']}", self.fS)
+            for i in range(5)
+        ]
+
+        # Launcher buttons for dual mode (questioner)
+        lw, lh = 120, 52
+        lx0 = (W - (4 * lw + 3 * gap)) // 2
+        self.launcher_btns = [
+            _Btn((lx0 + i * (lw + gap), INPUT_Y + 32, lw, lh),
+                 f"Launcher {i+1}", self.fS, cn=(34, 42, 70), ch=C_ACCENT)
+            for i in range(4)
+        ]
+
+    # ─────────────────────────────────────────────────────────
+    # Fullscreen
+    # ─────────────────────────────────────────────────────────
+
+    def _toggle_fullscreen(self) -> None:
+        self._fullscreen = not self._fullscreen
+        if self._fullscreen:
+            self._screen_surf = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
+        else:
+            self._screen_surf = pygame.display.set_mode((W, H))
+
+    def _canvas_mouse(self):
+        mx, my = pygame.mouse.get_pos()
+        if not self._fullscreen:
+            return mx, my
+        sw, sh = self._screen_surf.get_size()
+        scale = min(sw / W, sh / H)
+        ox = (sw - W * scale) / 2
+        oy = (sh - H * scale) / 2
+        return (mx - ox) / scale, (my - oy) / scale
+
+    # ─────────────────────────────────────────────────────────
+    # Run
+    # ─────────────────────────────────────────────────────────
 
     def run(self) -> None:
-        """
-        pygame main loop를 실행합니다.
-        """
-        while self.running:
-            self.clock.tick(cfg.FPS)
-
-            self._handle_events()
-
-            # 게임 로직 업데이트는 engine에 위임합니다.
-            self.engine.update()
-
-            self._draw()
-
+        while self.alive:
+            self.clock.tick(60)
+            evs = pygame.event.get()
+            mp  = self._canvas_mouse()
+            self._events(evs, mp)
+            self._update()
+            self._draw(mp)
         pygame.quit()
 
-    # ========================================================
-    # Event handling
-    # ========================================================
+    # ─────────────────────────────────────────────────────────
+    # Events
+    # ─────────────────────────────────────────────────────────
 
-    def _handle_events(self) -> None:
-        mouse_pos = pygame.mouse.get_pos()
+    def _events(self, evs, mp):
+        for ev in evs:
+            if ev.type == pygame.QUIT:
+                self.alive = False
+            elif ev.type == pygame.KEYDOWN:
+                self._key(ev.key)
+            elif ev.type == pygame.MOUSEBUTTONDOWN:
+                self._click(mp, ev)
 
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                self.running = False
+    def _key(self, k):
+        if k == pygame.K_F11:
+            self._toggle_fullscreen()
+            return
+        if k == pygame.K_ESCAPE:
+            if self._fullscreen:
+                self._toggle_fullscreen()
+            else:
+                self.alive = False
+            return
+        if k == pygame.K_q:
+            self.alive = False
+            return
 
-            elif event.type == pygame.KEYDOWN:
-                self._handle_keydown(event.key)
+        with self.st.lock:
+            scr = self.st.screen
+            wi  = self.st.waiting_input
+            sd  = self.st.selecting_diff
+            sl  = self.st.selecting_launcher
 
-            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                self._handle_mouse_click(mouse_pos)
+        if scr == "menu":
+            m = {pygame.K_1: "round", pygame.K_2: "score",
+                 pygame.K_3: "train",  pygame.K_4: "dual"}
+            if k in m: self._start(m[k])
 
-    def _handle_keydown(self, key: int) -> None:
-        if key == pygame.K_ESCAPE or key == pygame.K_q:
-            self.running = False
+        elif sl:
+            d = {pygame.K_1: 1, pygame.K_2: 2, pygame.K_3: 3, pygame.K_4: 4}
+            if k in d: self.eng.q.put(d[k])
 
-        elif key == pygame.K_SPACE:
-            if self.engine.state in [
-                GameEngine.STATE_MENU,
-                GameEngine.STATE_FINISHED,
-            ]:
-                self.engine.start_game()
+        elif wi:
+            if k == pygame.K_y: self.eng.q.put(True)
+            elif k == pygame.K_n: self.eng.q.put(False)
 
-        elif key == pygame.K_r:
-            self.engine.reset_to_menu()
+        elif sd:
+            d = {pygame.K_1: 1, pygame.K_2: 2, pygame.K_3: 3,
+                 pygame.K_4: 4, pygame.K_5: 5}
+            if k in d: self.eng.q.put(d[k])
 
-        elif key == pygame.K_1:
-            self.engine.set_difficulty("EASY")
+    def _click(self, mp, ev):
+        with self.st.lock:
+            scr = self.st.screen
+            wi  = self.st.waiting_input
+            sd  = self.st.selecting_diff
+            sl  = self.st.selecting_launcher
 
-        elif key == pygame.K_2:
-            self.engine.set_difficulty("NORMAL")
+        if scr == "menu":
+            for i, b in enumerate(self.menu_btns):
+                if b.hit(mp, ev):
+                    self._start(["round", "score", "train", "dual"][i])
 
-        elif key == pygame.K_3:
-            self.engine.set_difficulty("HARD")
+        elif sl:
+            for i, b in enumerate(self.launcher_btns):
+                if b.hit(mp, ev): self.eng.q.put(i + 1)
 
-    def _handle_mouse_click(self, mouse_pos: Tuple[int, int]) -> None:
-        if self.engine.state == GameEngine.STATE_MENU:
-            for difficulty_name, button in self.difficulty_buttons.items():
-                if button.is_hovered(mouse_pos):
-                    self.engine.set_difficulty(difficulty_name)
+        elif wi:
+            if self.yes_btn.hit(mp, ev): self.eng.q.put(True)
+            elif self.no_btn.hit(mp, ev): self.eng.q.put(False)
 
-            if self.start_button.is_hovered(mouse_pos):
-                self.engine.start_game()
+        elif sd:
+            for i, b in enumerate(self.diff_btns):
+                if b.hit(mp, ev): self.eng.q.put(i + 1)
 
-        elif self.engine.state == GameEngine.STATE_FINISHED:
-            if self.restart_button.is_hovered(mouse_pos):
-                self.engine.start_game()
+    def _start(self, mode: str):
+        with self.st.lock:
+            self.st.screen       = "game"
+            self.st.mode         = mode
+            self.st.line0        = ""
+            self.st.line1        = ""
+            self.st.round_result = None
+            self.st.dual_result  = None
+        self.balls.clear()
 
-    # ========================================================
+        fn = {
+            "round": self.eng.run_round_mode,
+            "score": self.eng.run_score_mode,
+            "train": self.eng.run_train_mode,
+            "dual":  self.eng.run_dual_mode,
+        }[mode]
+
+        def _run():
+            try:
+                fn()
+            except Exception:
+                import traceback; traceback.print_exc()
+            finally:
+                with self.st.lock:
+                    self.st.screen       = "menu"
+                    self.st.line0        = ""
+                    self.st.line1        = ""
+                    self.st.round_result = None
+                    self.st.dual_result  = None
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    # ─────────────────────────────────────────────────────────
+    # Update
+    # ─────────────────────────────────────────────────────────
+
+    def _update(self):
+        with self.st.lock:
+            spawns = self.st.pending_spawns.copy()
+            self.st.pending_spawns.clear()
+        for n in spawns:
+            self.balls.append(Ball(n - 1))
+        self.balls = [b for b in self.balls if b.update()]
+
+    # ─────────────────────────────────────────────────────────
     # Draw
-    # ========================================================
+    # ─────────────────────────────────────────────────────────
 
-    def _draw(self) -> None:
-        self.screen.fill(cfg.COLOR_BG)
+    def _draw(self, mp):
+        self.surf.fill(C_BG)
 
-        if self.engine.state == GameEngine.STATE_MENU:
-            self._draw_menu()
+        with self.st.lock:
+            scr  = self.st.screen
+            mode = self.st.mode
+            act  = self.st.active_launchers.copy()
+            l0   = self.st.line0
+            l1   = self.st.line1
+            rr   = self.st.round_result
+            wi   = self.st.waiting_input
+            sd   = self.st.selecting_diff
+            sl   = self.st.selecting_launcher
+            qr   = self.st.questioner
+            prm  = self.st.prompt
+            dr   = self.st.dual_result
 
-        elif self.engine.state == GameEngine.STATE_RUNNING:
-            self._draw_running()
+        if scr == "menu":
+            self._draw_menu(mp)
+        elif dr is not None:
+            self._draw_dual_result(dr, wi, mp, prm)
+        else:
+            self._draw_top(mode)
+            self._draw_launchers(act)
+            for b in self.balls:
+                b.draw(self.surf)
+            self._draw_status(l0, l1, act, rr)
 
-        elif self.engine.state == GameEngine.STATE_FINISHED:
-            self._draw_finished()
+            if wi:
+                self._draw_yn(mp, prm)
+            elif sl:
+                self._draw_launcher_select(mp, qr)
+            elif sd:
+                self._draw_diff(mp)
+            else:
+                self._t("Q: Quit", self.fX, C_DIM, br=(W-12, H-8))
 
+        sw, sh = self._screen_surf.get_size()
+        if self._fullscreen:
+            scale = min(sw / W, sh / H)
+            nw, nh = int(W * scale), int(H * scale)
+            scaled = pygame.transform.smoothscale(self.surf, (nw, nh))
+            self._screen_surf.fill((0, 0, 0))
+            self._screen_surf.blit(scaled, ((sw - nw) // 2, (sh - nh) // 2))
+        else:
+            self._screen_surf.blit(self.surf, (0, 0))
         pygame.display.flip()
 
-    def _draw_menu(self) -> None:
-        mouse_pos = pygame.mouse.get_pos()
+    # ── Menu ──────────────────────────────────────────────────
 
-        self._draw_text(
-            "ME340 Reaction Launcher",
-            self.font_title,
-            cfg.COLOR_TEXT,
-            center=(cfg.WINDOW_WIDTH // 2, 95),
-        )
+    def _draw_menu(self, mp):
+        self._t("REFLECTION SPEED MEASUREMENT GAME", self.fL, C_TEXT, c=(W//2, 105))
+        if cfg.SIMULATION_MODE:
+            self._t("SIMULATION MODE", self.fS, C_WARN, c=(W//2, 142))
+        for b in self.menu_btns:
+            b.draw(self.surf, mp)
+        self._t("1-4 or click    Q: Quit    F11: Fullscreen", self.fX, C_DIM, c=(W//2, 520))
 
-        self._draw_text(
-            "Raspberry Pi: high-level controller  |  Arduino Mega: actuator driver",
-            self.font_small,
-            cfg.COLOR_TEXT_MUTED,
-            center=(cfg.WINDOW_WIDTH // 2, 155),
-        )
+    # ── Game screen ───────────────────────────────────────────
 
-        self._draw_text(
-            "Select difficulty",
-            self.font_medium,
-            cfg.COLOR_TEXT,
-            center=(cfg.WINDOW_WIDTH // 2, 200),
-        )
+    def _draw_top(self, mode: str):
+        pygame.draw.rect(self.surf, C_PANEL, (0, 0, W, 52))
+        names = {"round": "Round Mode", "score": "Score Mode",
+                 "train": "Train Mode", "dual":  "Dual Mode"}
+        self._t(names.get(mode, ""), self.fM, C_TEXT, tl=(18, 14))
+        if cfg.SIMULATION_MODE:
+            self._t("[SIM]", self.fX, C_WARN, tr=(W-80, 18))
+        self._t("Q: Quit", self.fX, C_DIM, tr=(W-15, 18))
 
-        for difficulty_name, button in self.difficulty_buttons.items():
-            button.draw(
-                self.screen,
-                mouse_pos,
-                active=(difficulty_name == self.engine.difficulty_name),
-            )
+    def _draw_launchers(self, active: set):
+        for i, cx in enumerate(L_XS):
+            n       = i + 1
+            on_fire = n in active
+            col     = C_FIRE if on_fire else C_LAUNCHER
+            pygame.draw.rect(self.surf, col,
+                             (cx-L_W//2, L_TOP, L_W, L_BTM-L_TOP),
+                             border_radius=8)
+            pygame.draw.rect(self.surf, C_BG,
+                             (cx-L_W//2+8, L_BTM-10, L_W-16, 14),
+                             border_radius=4)
+            if on_fire:
+                pygame.draw.rect(self.surf, C_FIRE,
+                                 (cx-L_W//2, L_TOP, L_W, L_BTM-L_TOP),
+                                 3, border_radius=8)
+            nc = (20, 12, 4) if on_fire else C_DIM
+            self._t(str(n), self.fLN, nc, c=(cx, L_TOP + (L_BTM-L_TOP)//2))
 
-        self.start_button.draw(self.screen, mouse_pos)
+    def _draw_status(self, l0: str, l1: str, active: set, rr: dict | None):
+        l0s, l1s = l0.strip(), l1.strip()
+        cy = STATUS_CY
 
-        self._draw_text(
-            self.engine.status_message,
-            self.font_small,
-            cfg.COLOR_TEXT_MUTED,
-            center=(cfg.WINDOW_WIDTH // 2, 425),
-        )
+        if active:
+            self._t("LAUNCHING", self.fT, C_WARN, c=(W//2, cy-8))
+            nums = "  ".join(str(n) for n in sorted(active))
+            self._t(f"Launcher  {nums}", self.fM, C_FIRE, c=(W//2, cy+38))
 
-        self._draw_text(
-            "Keyboard: 1=Easy, 2=Normal, 3=Hard, Space=Start, Q=Quit",
-            self.font_tiny,
-            cfg.COLOR_TEXT_MUTED,
-            center=(cfg.WINDOW_WIDTH // 2, 470),
-        )
+        elif rr is not None:
+            # explicit round result — always show this regardless of line content
+            cnt  = rr["count"]
+            tot  = rr["total"]
+            lvl  = rr["level"]
+            ok   = rr["passed"]
+            self._t(f"Level {lvl}", self.fM, C_DIM, c=(W//2, cy-34))
+            col  = C_SUCCESS if ok else C_DANGER
+            label = "PASS" if ok else "FAIL"
+            self._t(f"{label}  {cnt} / {tot}", self.fT, col, c=(W//2, cy+4))
 
-        self._draw_connection_status()
+        elif l1s.isdigit():
+            if "Starting" in l0:
+                self._t(l0s, self.fM, C_TEXT,  c=(W//2, cy - 30))
+                self._t(l1s, self.fT, C_ACCENT, c=(W//2, cy + 14))
+            elif "Firing" in l0:
+                self._t(l1s, self.fT, C_ACCENT, c=(W//2, cy - 12))
+                self._t(l0s, self.fM, C_WARN,   c=(W//2, cy + 36))
+            else:
+                self._t(l1s, self.fT, C_ACCENT, c=(W//2, cy - 12))
+                self._t("seconds remaining", self.fS, C_DIM, c=(W//2, cy + 36))
 
-    def _draw_running(self) -> None:
-        self._draw_top_bar()
+        elif "GAME CLEAR" in l0:
+            self._t(l0s, self.fT, C_SUCCESS, c=(W//2, cy-18))
+            self._t(l1s, self.fL, C_WARN,    c=(W//2, cy+28))
 
-        remaining_time = self.engine.get_remaining_time()
-        next_launch_time = self.engine.get_time_until_next_launch()
+        elif "GAME OVER" in l0:
+            self._t(l0s, self.fT, C_DANGER, c=(W//2, cy-18))
+            self._t(l1s, self.fL, C_WARN,   c=(W//2, cy+28))
 
-        self._draw_text(
-            f"{remaining_time:04.1f}",
-            self.font_title,
-            cfg.COLOR_ACCENT,
-            center=(cfg.WINDOW_WIDTH // 2, 125),
-        )
+        elif "Score:" in l0:
+            self._t(l0s, self.fT, C_SUCCESS, c=(W//2, cy-14))
+            self._t(l1s, self.fM, C_DIM,     c=(W//2, cy+32))
 
-        self._draw_text(
-            "seconds remaining",
-            self.font_small,
-            cfg.COLOR_TEXT_MUTED,
-            center=(cfg.WINDOW_WIDTH // 2, 175),
-        )
-
-        self._draw_game_panel()
-
-        if self.engine.current_launcher is not None:
-            launcher_text = f"Launcher {self.engine.current_launcher}"
-            launcher_color = cfg.COLOR_WARNING
         else:
-            launcher_text = "Waiting"
-            launcher_color = cfg.COLOR_TEXT_MUTED
+            if l0s:
+                self._t(l0s, self.fL, C_TEXT, c=(W//2, cy-14))
+            if l1s:
+                self._t(l1s, self.fM, C_DIM,  c=(W//2, cy+22))
 
-        self._draw_text(
-            launcher_text,
-            self.font_large,
-            launcher_color,
-            center=(cfg.WINDOW_WIDTH // 2, 285),
-        )
+    def _draw_yn(self, mp, prompt: str):
+        pygame.draw.rect(self.surf, C_PANEL, (0, INPUT_Y-10, W, H-INPUT_Y+10))
+        self._t(prompt.strip(), self.fM, C_TEXT, c=(W//2, INPUT_Y+6))
+        self.yes_btn.draw(self.surf, mp)
+        self.no_btn.draw(self.surf, mp)
+        self._t("Y / N   or click", self.fX, C_DIM, c=(W//2, H-10))
 
-        if self.engine.launch_in_progress:
-            sub_text = "Command sent to Arduino Mega."
+    def _draw_diff(self, mp):
+        pygame.draw.rect(self.surf, C_PANEL, (0, INPUT_Y-10, W, H-INPUT_Y+10))
+        self._t("Choose Level (1-5)", self.fM, C_TEXT, c=(W//2, INPUT_Y+4))
+        for b in self.diff_btns:
+            b.draw(self.surf, mp)
+        self._t("1-5   or click", self.fX, C_DIM, c=(W//2, H-10))
+
+    def _draw_launcher_select(self, mp, questioner: str):
+        pygame.draw.rect(self.surf, C_PANEL, (0, INPUT_Y-10, W, H-INPUT_Y+10))
+        self._t(f"Player {questioner}: select launcher (1-4)",
+                self.fM, C_WARN, c=(W//2, INPUT_Y+6))
+        for b in self.launcher_btns:
+            b.draw(self.surf, mp)
+        self._t("1-4   or click    20s timeout", self.fX, C_DIM, c=(W//2, H-10))
+
+    # ── Dual final result ─────────────────────────────────────
+
+    def _draw_dual_result(self, dr: dict, wi: bool, mp, prompt: str):
+        a = dr["a"]
+        b = dr.get("b")
+
+        if b is None:
+            # Only A played
+            self._t("DUAL MODE", self.fL, C_TEXT, c=(W//2, 120))
+            self._t(f"Player A:  {a} / {cfg.DUAL_BALLS}",
+                    self.fT, C_ACCENT, c=(W//2, 240))
         else:
-            sub_text = f"Next launch in {next_launch_time:03.1f} sec"
+            # Split screen
+            mid = W // 2
+            pygame.draw.rect(self.surf, C_PANEL,  (0,   0, mid, H))
+            pygame.draw.rect(self.surf, (20,20,40), (mid, 0, mid, H))
+            pygame.draw.line(self.surf, C_DIM, (mid, 0), (mid, H), 2)
 
-        self._draw_text(
-            sub_text,
-            self.font_small,
-            cfg.COLOR_TEXT_MUTED,
-            center=(cfg.WINDOW_WIDTH // 2, 330),
-        )
+            col_a = C_SUCCESS if a >= b else C_TEXT
+            col_b = C_SUCCESS if b > a  else C_TEXT
 
-        self._draw_text(
-            self.engine.status_message,
-            self.font_tiny,
-            cfg.COLOR_TEXT_MUTED,
-            center=(cfg.WINDOW_WIDTH // 2, 365),
-        )
+            self._t("Player A", self.fL, C_DIM,   c=(mid//2, 160))
+            self._t(str(a),     self.fT, col_a,   c=(mid//2, 240))
+            self._t(f"/ {cfg.DUAL_BALLS}", self.fM, C_DIM, c=(mid//2, 295))
 
-        self._draw_text(
-            "ESC/Q: Quit    R: Menu",
-            self.font_tiny,
-            cfg.COLOR_TEXT_MUTED,
-            center=(cfg.WINDOW_WIDTH // 2, 490),
-        )
+            self._t("Player B", self.fL, C_DIM,          c=(mid + mid//2, 160))
+            self._t(str(b),     self.fT, col_b,          c=(mid + mid//2, 240))
+            self._t(f"/ {cfg.DUAL_BALLS}", self.fM, C_DIM, c=(mid + mid//2, 295))
 
-    def _draw_finished(self) -> None:
-        mouse_pos = pygame.mouse.get_pos()
+            if a > b:
+                winner = "Winner: Player A"
+                wc = col_a
+            elif b > a:
+                winner = "Winner: Player B"
+                wc = col_b
+            else:
+                winner = "Draw!"
+                wc = C_WARN
+            self._t(winner, self.fL, wc, c=(W//2, 380))
 
-        self._draw_text(
-            "Game Finished",
-            self.font_title,
-            cfg.COLOR_TEXT,
-            center=(cfg.WINDOW_WIDTH // 2, 105),
-        )
+        if wi:
+            pygame.draw.rect(self.surf, C_PANEL, (0, INPUT_Y-10, W, H-INPUT_Y+10))
+            self._t(prompt.strip(), self.fM, C_TEXT, c=(W//2, INPUT_Y+6))
+            self.yes_btn.draw(self.surf, mp)
+            self.no_btn.draw(self.surf, mp)
 
-        self._draw_text(
-            f"Score: {self.engine.score}",
-            self.font_large,
-            cfg.COLOR_SUCCESS,
-            center=(cfg.WINDOW_WIDTH // 2, 190),
-        )
+    # ── Text helper ───────────────────────────────────────────
 
-        self._draw_text(
-            f"Total launcher commands: {self.engine.total_launch_count}",
-            self.font_medium,
-            cfg.COLOR_TEXT_MUTED,
-            center=(cfg.WINDOW_WIDTH // 2, 245),
-        )
+    def _t(self, text, font, color, c=None, tl=None, tr=None, br=None):
+        s = font.render(text, True, color)
+        r = s.get_rect()
+        if c:    r.center      = c
+        elif tl: r.topleft     = tl
+        elif tr: r.topright    = tr
+        elif br: r.bottomright = br
+        self.surf.blit(s, r)
 
-        self.restart_button.draw(self.screen, mouse_pos)
 
-        self._draw_text(
-            "Space: Restart    R: Menu    Q: Quit",
-            self.font_small,
-            cfg.COLOR_TEXT_MUTED,
-            center=(cfg.WINDOW_WIDTH // 2, 455),
-        )
+# ─────────────────────────────────────────────────────────────
 
-        self._draw_connection_status()
-
-    def _draw_top_bar(self) -> None:
-        pygame.draw.rect(
-            self.screen,
-            cfg.COLOR_PANEL,
-            pygame.Rect(0, 0, cfg.WINDOW_WIDTH, 72),
-        )
-
-        self._draw_text(
-            f"Difficulty: {self.engine.difficulty_name}",
-            self.font_small,
-            cfg.COLOR_TEXT,
-            topleft=(28, 24),
-        )
-
-        self._draw_text(
-            f"Score: {self.engine.score}",
-            self.font_small,
-            cfg.COLOR_TEXT,
-            topright=(cfg.WINDOW_WIDTH - 28, 24),
-        )
-
-    def _draw_game_panel(self) -> None:
-        panel_rect = pygame.Rect(150, 215, 600, 190)
-
-        pygame.draw.rect(
-            self.screen,
-            cfg.COLOR_PANEL,
-            panel_rect,
-            border_radius=20,
-        )
-
-        self._draw_text(
-            f"Launch Count: {self.engine.total_launch_count}",
-            self.font_small,
-            cfg.COLOR_TEXT_MUTED,
-            center=(cfg.WINDOW_WIDTH // 2, 395),
-        )
-
-    def _draw_connection_status(self) -> None:
-        if self.engine.is_hardware_connected():
-            text = "Launcher Arduino: Connected"
-            color = cfg.COLOR_SUCCESS
-        else:
-            text = "Launcher Arduino: Not connected"
-            color = cfg.COLOR_ERROR
-
-        self._draw_text(
-            text,
-            self.font_tiny,
-            color,
-            bottomright=(cfg.WINDOW_WIDTH - 24, cfg.WINDOW_HEIGHT - 18),
-        )
-
-    def _draw_text(
-        self,
-        text: str,
-        font: pygame.font.Font,
-        color: Tuple[int, int, int],
-        center: Optional[Tuple[int, int]] = None,
-        topleft: Optional[Tuple[int, int]] = None,
-        topright: Optional[Tuple[int, int]] = None,
-        bottomright: Optional[Tuple[int, int]] = None,
-    ) -> None:
-        text_surface = font.render(text, True, color)
-        text_rect = text_surface.get_rect()
-
-        if center is not None:
-            text_rect.center = center
-        elif topleft is not None:
-            text_rect.topleft = topleft
-        elif topright is not None:
-            text_rect.topright = topright
-        elif bottomright is not None:
-            text_rect.bottomright = bottomright
-        else:
-            text_rect.topleft = (0, 0)
-
-        self.screen.blit(text_surface, text_rect)
+if __name__ == "__main__":
+    GameScreen().run()
